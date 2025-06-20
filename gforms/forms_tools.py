@@ -1,9 +1,3 @@
-"""
-Google Forms MCP Tools
-
-This module provides MCP tools for interacting with Google Forms API.
-"""
-
 import logging
 import asyncio
 from typing import List, Optional, Dict, Any
@@ -26,19 +20,86 @@ async def create_form(
     user_google_email: str,
     title: str,
     description: Optional[str] = None,
-    document_title: Optional[str] = None
+    document_title: Optional[str] = None,
+    questions: Optional[List[Dict[str, Any]]] = None
 ) -> str:
     """
-    Create a new form using the title given in the provided form message in the request.
+    Create a new Google Form with optional initial questions.
+
+    This function allows for the creation of a new Google Form, optionally populating it
+    with a predefined set of questions during the initial creation call. This streamlines
+    the form setup process by eliminating the need for subsequent batch update calls
+    to add questions.
 
     Args:
         user_google_email (str): The user's Google email address. Required.
         title (str): The title of the form.
         description (Optional[str]): The description of the form.
         document_title (Optional[str]): The document title (shown in browser tab).
+        questions (Optional[List[Dict[str, Any]]]): A list of dictionaries, where each
+            dictionary defines a question to be added to the form. Each question
+            dictionary must include a 'type' and 'title' field, and may include
+            additional fields based on the question type.
+
+            Supported 'type' values and their schemas:
+
+            - "TEXT_QUESTION":
+                {
+                  "title": "string",
+                  "type": "TEXT_QUESTION",
+                  "description": "string (optional)",
+                  "required": "boolean (optional, default: false)"
+                }
+
+            - "MULTIPLE_CHOICE_QUESTION":
+                {
+                  "title": "string",
+                  "type": "MULTIPLE_CHOICE_QUESTION",
+                  "description": "string (optional)",
+                  "required": "boolean (optional, default: false)",
+                  "options": ["string", ...] (required)
+                }
+
+            - "SCALE_QUESTION":
+                {
+                  "title": "string",
+                  "type": "SCALE_QUESTION",
+                  "description": "string (optional)",
+                  "required": "boolean (optional, default: false)",
+                  "scale_min": "integer (required, typically 0 or 1)",
+                  "scale_max": "integer (required, typically 2-10)",
+                  "scale_labels": {"min_value": "string", "max_value": "string"} (optional)
+                }
+
+            - "CHECKBOX_QUESTION":
+                {
+                  "title": "string",
+                  "type": "CHECKBOX_QUESTION",
+                  "description": "string (optional)",
+                  "required": "boolean (optional, default: false)",
+                  "options": ["string", ...] (required)
+                }
+
+            - "DATE_QUESTION":
+                {
+                  "title": "string",
+                  "type": "DATE_QUESTION",
+                  "description": "string (optional)",
+                  "required": "boolean (optional, default: false)",
+                  "include_time": "boolean (optional, default: false)",
+                  "include_year": "boolean (optional, default: true)"
+                }
+
+            - "TIME_QUESTION":
+                {
+                  "title": "string",
+                  "type": "TIME_QUESTION",
+                  "description": "string (optional)",
+                  "required": "boolean (optional, default: false)"
+                }
 
     Returns:
-        str: Confirmation message with form ID and edit URL.
+        str: Confirmation message with form ID, edit URL, and responder URL.
     """
     logger.info(f"[create_form] Invoked. Email: '{user_google_email}', Title: {title}")
 
@@ -52,7 +113,7 @@ async def create_form(
         form_body["info"]["description"] = description
         
     if document_title:
-        form_body["info"]["document_title"] = document_title
+        form_body["info"]["documentTitle"] = document_title # Corrected from document_title to documentTitle
 
     created_form = await asyncio.to_thread(
         service.forms().create(body=form_body).execute
@@ -62,9 +123,93 @@ async def create_form(
     edit_url = f"https://docs.google.com/forms/d/{form_id}/edit"
     responder_url = created_form.get("responderUri", f"https://docs.google.com/forms/d/{form_id}/viewform")
     
+    if questions:
+        logger.info(f"Adding {len(questions)} questions to form {form_id}.")
+        question_requests = _build_question_requests(questions)
+        batch_update_body = {"requests": question_requests}
+        
+        try:
+            await asyncio.to_thread(
+                service.forms().batchUpdate(formId=form_id, body=batch_update_body).execute
+            )
+            logger.info(f"Successfully added questions to form {form_id}.")
+        except HttpError as e:
+            logger.error(f"Failed to add questions to form {form_id}: {e}")
+            # Continue with form creation confirmation even if questions failed
+            confirmation_message = f"Successfully created form '{created_form.get('info', {}).get('title', title)}' for {user_google_email}. Form ID: {form_id}. Edit URL: {edit_url}. Responder URL: {responder_url}. WARNING: Failed to add questions due to an error: {e}"
+            return confirmation_message
+
     confirmation_message = f"Successfully created form '{created_form.get('info', {}).get('title', title)}' for {user_google_email}. Form ID: {form_id}. Edit URL: {edit_url}. Responder URL: {responder_url}"
     logger.info(f"Form created successfully for {user_google_email}. ID: {form_id}")
     return confirmation_message
+
+def _build_question_requests(questions: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """
+    Helper function to convert simplified question schema to Google Forms API Request objects.
+    """
+    requests = []
+    for i, q in enumerate(questions):
+        question_type = q.get("type")
+        question_title = q.get("title")
+        question_description = q.get("description")
+        question_required = q.get("required", False)
+
+        item = {
+            "title": question_title,
+            "description": question_description,
+            "questionItem": {
+                "question": {
+                    "required": question_required
+                }
+            }
+        }
+
+        if question_type == "TEXT_QUESTION":
+            item["questionItem"]["question"]["textQuestion"] = {}
+        elif question_type == "MULTIPLE_CHOICE_QUESTION":
+            options = q.get("options", [])
+            item["questionItem"]["question"]["choiceQuestion"] = {
+                "type": "RADIO",
+                "options": [{"value": opt} for opt in options]
+            }
+        elif question_type == "SCALE_QUESTION":
+            scale_min = q.get("scale_min")
+            scale_max = q.get("scale_max")
+            scale_labels = q.get("scale_labels", {})
+            item["questionItem"]["question"]["scaleQuestion"] = {
+                "low": scale_min,
+                "high": scale_max,
+                "lowLabel": scale_labels.get(str(scale_min)),
+                "highLabel": scale_labels.get(str(scale_max))
+            }
+        elif question_type == "CHECKBOX_QUESTION":
+            options = q.get("options", [])
+            item["questionItem"]["question"]["choiceQuestion"] = {
+                "type": "CHECKBOX",
+                "options": [{"value": opt} for opt in options]
+            }
+        elif question_type == "DATE_QUESTION":
+            include_time = q.get("include_time", False)
+            include_year = q.get("include_year", True)
+            item["questionItem"]["question"]["dateQuestion"] = {
+                "includeTime": include_time,
+                "includeYear": include_year
+            }
+        elif question_type == "TIME_QUESTION":
+            item["questionItem"]["question"]["timeQuestion"] = {}
+        else:
+            logger.warning(f"Unsupported question type: {question_type}. Skipping question: {question_title}")
+            continue
+
+        requests.append({
+            "createItem": {
+                "item": item,
+                "location": {
+                    "index": i # Add questions sequentially
+                }
+            }
+        })
+    return requests
 
 
 @server.tool()
@@ -191,7 +336,7 @@ async def get_form_response(
     create_time = response.get("createTime", "Unknown")
     last_submitted_time = response.get("lastSubmittedTime", "Unknown")
     
-    answers = response.get("answers", {})
+    answers = response.get("answers", {}))
     answer_details = []
     for question_id, answer_data in answers.items():
         question_response = answer_data.get("textAnswers", {}).get("answers", [])
